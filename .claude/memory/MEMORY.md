@@ -1,0 +1,3 @@
+- [LCD reading pipeline](project_lcd_pipeline.md) — working script location, architecture, dataset layout
+- [LCD reader workflow feedback](feedback_lcd_reader_workflow.md) — automation stance, scope discipline, what was tried and reverted
+- [Always add charts](feedback_always_add_charts.md) — add weight-vs-time chart to every *_weights.xlsx automatically, don't wait to be asked
