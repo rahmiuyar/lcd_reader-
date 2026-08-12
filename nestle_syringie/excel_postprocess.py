@@ -3,12 +3,11 @@
 Post-process a *_weights.xlsx produced by the pipeline: flag which rows are
 single-frame misreads (without ever altering or substituting a value - a
 flagged row's weight is simply left out, everything else stays exactly as
-read), detect and discard a leading invalid segment before a genuine reset/
-retare event, a data-derived dispense-start-corrected time column, and a
-second sheet converting the kept weight to remaining syringe volume (mL,
-assuming water density). Everything is done as live Excel formulas (not
-baked-in Python values) referencing a small, labeled parameter block, so
-the thresholds are visible and adjustable directly in the spreadsheet.
+read), a data-derived dispense-start-corrected time column, and a second
+sheet converting the kept weight to remaining syringe volume (mL, assuming
+water density). Everything is done as live Excel formulas (not baked-in
+Python values) referencing a small, labeled parameter block, so the
+thresholds are visible and adjustable directly in the spreadsheet.
 
 History of the filter shape (why it looks like this):
   v1 - carry-forward filter (each row compared to the previous ACCEPTED
@@ -25,54 +24,41 @@ History of the filter shape (why it looks like this):
        untouched. 12 keeps bursts like that a minority while still
        resolving real multi-second transitions, and barely changes the
        clean file's exclusion count (iddsi2-10ml-1: 29 -> 31 of 2104).
-  v4 - added leading-segment / reset detection (this version): some
-       recordings start with a sustained WRONG plateau before the real
-       experiment (iddsi2-20ml-2 spends its first ~20s reading ~8.5g when
-       the true start is a hard reset down to ~1g at t=21s that then rises
-       normally; iddsi2-20ml-1 shows the same shape at t=9-10s, and
-       separately-confirmed visually to be a genuine OCR bug - the display
-       reads "0.00" the whole time but a bad digit-box split decodes it as
-       ~8.4-8.9g). A per-row local-window filter can't touch this because
-       the whole plateau is internally consistent (nothing in it deviates
-       from ITS OWN neighborhood) - it needs a different rule: find the
-       single largest sustained drop anywhere in the trend (comparing each
-       row's local median to the local median LOOKBACK rows earlier) and,
-       if it exceeds the reset threshold, treat every row before it as
-       invalid. Checked this doesn't false-trigger: iddsi2-10ml-1 (no
-       reset, monotonic from the start) has a max drop of 0.01g, nowhere
-       near the threshold, vs. 7.4-7.5g on the two files that do have one.
-       Threshold raised 2.0 -> 5.0g after finding a false positive of its
-       own: once the v7 classify_digit fix cleaned up iddsi2-20ml-1's
-       leading segment, a dense burst of leading-digit-dropout misreads
-       elsewhere in the same file (e.g. "3.23" flickering to "0.03") still
-       transiently pulled the local median down by 3.18g - close enough to
-       the old 2.0g threshold to wrongly flag a reset. 5.0g keeps safe
-       margin below the real ~7.4g resets and above this noise ceiling.
+  v4 - added a leading-segment/reset detector (find the single largest
+       sustained drop in the trend, discard everything before it). Reverted
+       in v5: only validated against the two videos it was built for
+       (iddsi2-20ml-1/2, which both have junk BEFORE the real reset). Once
+       applied to the full dataset, the drop is more often a genuine
+       end-of-run tare/reset AFTER the real data (e.g. iddsi1-10ml-1: the
+       real 0->10g dispense curve is the first 85% of the recording, then
+       the scale gets zeroed) - the v4 rule silently kept the wrong side on
+       roughly 10 of 26 files, and a long OCR dropout stretch (a
+       MEDIAN() over a window with zero numeric readings) hard-errored
+       (#VALUE!) two files down to 0 kept rows. Simple local-outlier
+       rejection doesn't have a "which side is real" judgment call to get
+       backwards, so v5 drops the reset logic entirely rather than trying
+       to make the direction-detection more sophisticated.
 
 Sheet1 (original data) gains:
   E: local_median_g   - MEDIAN of a window of raw weight readings centered
-     on this row (window size in the parameter block). Reference value
-     only, never a replacement.
-  F: trend_ref_g       - local_median_g from LOOKBACK rows earlier (or this
-     row's own value if there aren't enough rows yet) - the "before" side
-     of the reset check below.
-  G: reset_drop_g       - F minus E (positive = the trend has dropped since
-     LOOKBACK rows ago).
-  H: excluded           - 1 if this row's raw weight is blank, deviates
-     from local_median_g by more than the tolerance, or falls before a
-     detected reset point; else 0.
-  I: weight_kept_g      - the ORIGINAL weight if not excluded, otherwise
+     on this row (window size in the parameter block; falls back to this
+     row's own value if its window has no other numeric readings, so an
+     isolated valid reading surrounded by OCR dropouts doesn't error).
+     Reference value only, never a replacement.
+  F: excluded          - 1 if this row's raw weight is blank or deviates
+     from local_median_g by more than the tolerance; else 0.
+  G: weight_kept_g      - the ORIGINAL weight if not excluded, otherwise
      #N/A (which both Excel and LibreOffice charts treat as a real gap -
      see the note above the formula for why this isn't "" instead). Never
      a substituted or carried-forward number.
-  J: is_started         - 1 once the raw weight first reaches the start
-     threshold AND (if a reset was detected) this row is at/after it.
-  K: time_corrected_s   - timestamp_sec minus the detected dispense-start
-     time (first timestamp where is_started flips to 1) - negative before
-     the detected start, 0 at start.
+  H: is_started         - 1 once the raw weight first reaches the start
+     threshold.
+  I: time_corrected_s   - timestamp_sec minus the detected dispense-start
+     time (first timestamp where is_started flips to 1, or 0 if the
+     threshold is never reached) - negative before the detected start, 0
+     at start.
   Parameter block: window size, exclusion tolerance, start threshold,
-     syringe volume, density, reset lookback/threshold, plus computed
-     max-drop / reset-detected / reset-time / start-time cells - all
+     syringe volume, density, plus a computed start-time cell - all
      editable/inspectable directly in the spreadsheet.
 
 New sheet "Hacim" (Volume): time_corrected_s vs remaining volume in the
@@ -103,20 +89,10 @@ MEDIAN_WINDOW = 20  # rows on each side (41-row window total) - widened from 12:
 # 12-wide windows (e.g. t=57.2s), and a "312"->"12" leading-digit-dropout
 # burst around t=118-120s similarly slipped through. 20 resolves both
 # (verified) while barely changing the clean file's exclusion count
-# (iddsi2-10ml-1: 30 -> 31 of 2104). Cost: on iddsi2-20ml-2's genuine
-# reset transition (~t=21s), one additional edge point right at the start
-# of the transition gets excluded (528 -> 553 of 1251 total) - the
-# transition itself stays clearly visible from its many other points, so
-# this is an acceptable trade for cleaning up the denser noise elsewhere.
+# (iddsi2-10ml-1: 30 -> 31 of 2104).
 EXCLUDE_TOLERANCE_G = 0.15
 START_THRESHOLD_G = 0.05
 DEFAULT_DENSITY = 1.0
-RESET_LOOKBACK_ROWS = 20  # ~2s at 10 samples/s
-RESET_THRESHOLD_G = 5.0  # see module docstring: real resets measured at 7.4-7.5g; noise-driven false
-# positives (a dense burst of leading-digit-dropout misreads, e.g. "3.23"
-# flickering to "0.03", can transiently pull the local median down enough
-# to look like a sustained drop) measured up to 3.18g on iddsi2-20ml-1
-# after the v7 classify_digit fix - 5.0 keeps safe margin on both sides.
 
 
 def infer_nominal_volume_ml(path):
@@ -140,14 +116,24 @@ def add_postprocess(path):
 
     header_font = Font(bold=True)
 
+    # clear stale J/K columns and N7:O14 parameter cells left over from the
+    # old v4 (reset-detection) layout on files postprocessed by an earlier
+    # version of this script - the new layout only uses E:I and N1:O8, and
+    # leftover formulas there would otherwise reference parameter cells
+    # (O11, O12, O14) that this version no longer writes.
+    for r in range(1, n_rows + 1):
+        ws.cell(r, 10).value = None  # J
+        ws.cell(r, 11).value = None  # K
+    for row_pair in (7, 9, 10, 11, 12, 13, 14):
+        ws.cell(row_pair, 14).value = None  # N
+        ws.cell(row_pair, 15).value = None  # O
+
     ws["E1"] = "local_median_g"
-    ws["F1"] = "trend_ref_g"
-    ws["G1"] = "reset_drop_g"
-    ws["H1"] = "excluded"
-    ws["I1"] = "weight_kept_g"
-    ws["J1"] = "is_started"
-    ws["K1"] = "time_corrected_s"
-    for cell in ("E1", "F1", "G1", "H1", "I1", "J1", "K1"):
+    ws["F1"] = "excluded"
+    ws["G1"] = "weight_kept_g"
+    ws["H1"] = "is_started"
+    ws["I1"] = "time_corrected_s"
+    for cell in ("E1", "F1", "G1", "H1", "I1"):
         ws[cell].font = header_font
 
     ws["N1"] = "Parametreler"
@@ -162,40 +148,30 @@ def add_postprocess(path):
     ws["O5"] = nominal_volume
     ws["N6"] = "Yogunluk (g/mL)"
     ws["O6"] = DEFAULT_DENSITY
-    ws["N7"] = "Reset bakis penceresi (satir)"
-    ws["O7"] = RESET_LOOKBACK_ROWS
-    ws["N8"] = "Reset esigi (g)"
-    ws["O8"] = RESET_THRESHOLD_G
-    ws["N10"] = "En buyuk dusus (g)"
-    ws["O10"] = f"=MAX(G{first_data_row}:G{n_rows})"
-    ws["N11"] = "Reset tespit edildi mi (1/0)"
-    ws["O11"] = f"=IF(O10>$O$8,1,0)"
-    ws["N12"] = "Reset zamani (s)"
-    ws["O12"] = f"=IF(O11=1,INDEX(B{first_data_row}:B{n_rows},MATCH(O10,G{first_data_row}:G{n_rows},0)),-1000000)"
-    ws["N14"] = "Baslangic zamani (s)"
-    ws["O14"] = f"=INDEX(B{first_data_row}:B{n_rows},MATCH(1,J{first_data_row}:J{n_rows},0))"
+    ws["N8"] = "Baslangic zamani (s)"
+    ws["O8"] = (
+        f"=IFERROR(INDEX(B{first_data_row}:B{n_rows},"
+        f"MATCH(1,H{first_data_row}:H{n_rows},0)),0)"
+    )
 
     for r in range(first_data_row, n_rows + 1):
         lo = max(first_data_row, r - MEDIAN_WINDOW)
         hi = min(n_rows, r + MEDIAN_WINDOW)
-        ws[f"E{r}"] = f"=MEDIAN(D{lo}:D{hi})"
+        # falls back to this row's own value if the window has no numeric
+        # readings at all (a long OCR-dropout stretch) - MEDIAN() of zero
+        # numbers is a hard error that would otherwise cascade through
+        # every formula referencing this cell.
+        ws[f"E{r}"] = f"=IFERROR(MEDIAN(D{lo}:D{hi}),D{r})"
 
-        ref_row = r - RESET_LOOKBACK_ROWS
-        ws[f"F{r}"] = f"=E{ref_row}" if ref_row >= first_data_row else f"=E{r}"
-        ws[f"G{r}"] = f"=F{r}-E{r}"
-
-        ws[f"H{r}"] = (
-            f"=IF(OR(NOT(ISNUMBER(D{r})),ABS(D{r}-E{r})>$O$3,"
-            f"AND($O$11=1,B{r}<$O$12)),1,0)"
-        )
+        ws[f"F{r}"] = f"=IF(OR(NOT(ISNUMBER(D{r})),ABS(D{r}-E{r})>$O$3),1,0)"
         # NA() rather than "" - a formula returning "" is still plotted as
         # y=0 by Excel/LibreOffice scatter charts (a well-known charting
         # gotcha), which showed up as stray points along the bottom of the
         # chart at every excluded row instead of a gap. #N/A is the
         # standard technique both engines actually skip when plotting.
-        ws[f"I{r}"] = f"=IF(H{r}=1,NA(),D{r})"
-        ws[f"J{r}"] = f"=IF(AND(ISNUMBER(D{r}),D{r}>=$O$4,OR($O$11=0,B{r}>=$O$12)),1,0)"
-        ws[f"K{r}"] = f"=B{r}-$O$14"
+        ws[f"G{r}"] = f"=IF(F{r}=1,NA(),D{r})"
+        ws[f"H{r}"] = f"=IF(AND(ISNUMBER(D{r}),D{r}>=$O$4),1,0)"
+        ws[f"I{r}"] = f"=B{r}-$O$8"
 
     # Kept weight vs corrected time - separate from the existing raw weight
     # chart so both are visible side by side for comparison. #N/A
@@ -212,8 +188,8 @@ def add_postprocess(path):
     chart.width = 24
     chart.height = 10
     chart.style = 2
-    x_ref = Reference(ws, min_col=11, min_row=first_data_row, max_row=n_rows)  # K: time_corrected_s
-    y_ref = Reference(ws, min_col=9, min_row=1, max_row=n_rows)  # I: weight_kept_g
+    x_ref = Reference(ws, min_col=9, min_row=first_data_row, max_row=n_rows)  # I: time_corrected_s
+    y_ref = Reference(ws, min_col=7, min_row=1, max_row=n_rows)  # G: weight_kept_g
     series = Series(y_ref, x_ref, title_from_data=True)
     series.marker = Marker(symbol="circle", size=5)
     series.marker.graphicalProperties = GraphicalProperties(solidFill=MARKER_COLOR)
@@ -231,8 +207,8 @@ def add_postprocess(path):
     vs["A1"].font = header_font
     vs["B1"].font = header_font
     for r in range(first_data_row, n_rows + 1):
-        vs[f"A{r}"] = f"=Sheet1!K{r}"
-        vs[f"B{r}"] = f"=IF(ISNA(Sheet1!I{r}),NA(),Sheet1!$O$5-(Sheet1!I{r}/Sheet1!$O$6))"
+        vs[f"A{r}"] = f"=Sheet1!I{r}"
+        vs[f"B{r}"] = f"=IF(ISNA(Sheet1!G{r}),NA(),Sheet1!$O$5-(Sheet1!G{r}/Sheet1!$O$6))"
 
     vchart = ScatterChart()
     vchart.title = f"{path.stem} - remaining syringe volume vs time"
